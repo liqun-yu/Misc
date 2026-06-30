@@ -5,6 +5,36 @@
 
 ---
 
+## ✅ RESOLUTION (2026-06-29) — `seq_length=2` chosen, VERIFIED correct & servable on v1/SPS — supersedes §3 (L138-141) and §5–§8
+
+**Decision: fix Bug 4 with `seq_length=2` on the generic candidate features (NOT the o2-named-clone approach of §5–§8).** The model fetches the *existing* generic feature table at both entity positions and reads the O2 slot. **No o2 clones, no cross-team Fabricator work, no feature recompute, no feed-service change, no training-data regeneration.**
+
+This **reverses** the earlier conclusion in §3 (L138-141: "the new fireworks model has no position mechanism; o2-naming is the only fix"). That was **wrong** — empirically disproven below.
+
+### How it's implemented (model side, already done)
+- `config/feature_config.py`: generic candidate names retained + `O2_SEQ_FEATURES` lists the 133 generic candidate features to seq.
+- `train_common.py`: patches the sibyl config to set `seq_length=2` on those 133 numerical features (direct dict patch on `sibyl_model_config["numerical_features"]` + assert count).
+- `modules/inference_module.py`: consumes 2 dense columns per seq-2 feature and **selects the last slot (`seq_index=1` = O2 candidate)** — `dense_features[:, start_pos + seq_len - 1]`. seq1 features unchanged (read slot 0).
+- 6 true duplicates dropped; `max_value=199_999` history-sequence fix retained. Retrained as `dbd_ranker_v0_metaflow_liqun_test_1782706667` (cache v17).
+- **No `ranker_dnn` change, no training regen:** the model reads *only* the O2 slot (discards O1), so the single value it sees at serving == the single O2 value the v6 parquet already holds. Train/serve consistent. (This corrects the earlier "leading direction" worry that regen + a model-graph change would be needed — they are not, because we *select* the O2 slot rather than consuming both.)
+
+### Why it's correct (code-grounded — see §3 machinery)
+feed-service already emits `business_id`/`store_id`/`vertical` at **`seqIndex=0=O1`** and **`seqIndex=1=O2`** (`BundleMLFeatureGenerator.kt:73-84`). SPS places O1→slot0, O2→slot1 (`FeatureStoreClient.kt:952/990`). The original bug is literally `ModelStore.kt:749` defaulting `seq_length=1` → it reads only slot 0 = O1. Setting `seq_length=2` + reading slot 1 = O2 is the exact, minimal fix. (The `*_o2b_*` seq1 features bind to the single-emission `o2_business_id` entity, so their slot 0 *is* O2 — no conflict with the SPS "unit features read slot 0" rule, which is per-entity.)
+
+### Empirical verification (three independent confirmations)
+1. **v2/Triton deploy CRASHED (generic path only).** The generic playground deploy sized `config.pbtxt numerical_features=[-1,161]` (a `len()` count) while the model wants `sum(seq_length)=294`. Live request → `HTTP 500: torch.select(dense_features, 1, 162)` index-out-of-bounds; sending 294 → `HTTP 400 Expected [-1,161]`. The 161-vs-294 gap is real **only for the generic v2 deploy path** (`triton_model_loader.py:221`).
+2. **v1/SPS `sibyl-library` validation PASSED.** `SibylTorchModelUtils.get_traced_script_module(validate_size=True, skip_validation=False)` builds a **294-wide** sample input from the config (seq-aware) and runs the model successfully → **v1/SPS serves W1 with no shape gap.** (Notebook: `DbD_debug/dbd_seqlen_v1_sps_validation_1782706667`.)
+3. **Offline differential — model reads O2.** Variant A (real @ slot1=O2, noise @ slot0) AUC **0.9079** ≫ Variant B (real @ slot0=O1) AUC **0.8057**, gap **+0.10** — exactly the 133 candidate features' contribution; A matches the training eval AUC. (Notebook: `DbD_debug/dbd_seqlen_eval_1782706667`.)
+
+### Serving path & guard
+- **DbD live prod = serving-v1 / SPS** (columbus `doubledash_store_recommendation_ranking` → `dbd_sr_v5_1_1`). W1 ships on v1 via a normal `register_sibyl_model_from_path` deploy. **The v2 crash does NOT block v1.** (The AIMS `…_migration_sv2` predictor is the in-progress v2 migration of the *old* model, owned by core-ml-platform — not live prod.) v2 migration: see §9.
+- **Guard fixed:** `training_flow.py` registered with `skip_validation=True`, which silently hid the 294 contract (validation would have caught the v2 mis-size at registration). **Flipped to `skip_validation=False` (2026-06-29)** — it PASSES for this model and now guards future runs.
+
+### Why NOT the o2-named-clone approach (§5–§8, retained below for reference but superseded)
+It re-materializes features that are *already computed*, needs cross-team Fabricator sources (cx_discovery / sponsored), and contradicts the purpose of `seq_length` (fetch one existing feature at multiple entity ids). `seq_length` achieves the identical fix with zero recompute and zero cross-team dependency. **Fabricator PR #30662** (materialize `baf_o1b_o2bizv` — Bug 3) is still valid independently; **#30661** (o2 clone sources) is **dropped**.
+
+---
+
 ## 0. TL;DR
 
 The ~0.25 AUC offline/online gap is driven by two serving-side defects in how candidate (O2) features reach the model. **Training data is correct (O2-keyed); the model is fine; the break is entirely in feature serving.**
@@ -122,7 +152,9 @@ This is the part that was most misunderstood. The mechanism is **`seqIndex`-base
 
 **Design provenance (no single platform RFC; it's a framework default + the LGBM→DNN migration).** The `seq_length`+`feat_ind` positional idiom is the **deprecated LGBM** mechanism (`sibyl-models`, `dbd_store_ranker_development`). The DNN migration's substantive change was **dropping positions entirely** in favor of distinct entity names — which the fireworks `SibylModelConfigGenerator` makes the default (flat serialization, `seq_length` defaults to 1 in [`aims_model_helpers.py`]). Note the named `o1_*`/`o2_*` store entities actually *predate* the DNN; the old LGBM used BOTH named o1/o2 store entities AND `seq_length`/`feat_ind` for its metric features. There is no platform-wide doc mandating name-based binding (the Sibyl onboarding guide still documents the older `seq_length`/`seq_index` mechanism as generally available); it's documented per-model — see [DbD Post Checkout Rankers (WIP)](https://doordash.atlassian.net/wiki/spaces/DOUB/pages/5623611394) and the DbD Master Doc.
 
-**⚠ The `seq_length`/`feat_ind` position trick does NOT apply to our new model.** It was the *old LGBM* mechanism. The new `dbd_ranker_v0_metaflow` model has no `seq_length`/`feat_ind` anywhere — so we will **not** fix Bug 4 by setting positions. SPS will always read position 0 (O1) for any generic-named feature regardless. The fix is purely O2-naming.
+**⚠⚠ SUPERSEDED (2026-06-29) — this paragraph is WRONG; see the RESOLUTION block at the top.** We empirically proved the opposite: `seq_length=2` *does* apply to the new fireworks model. The point it got right is that `seq_length` is **not auto-set** by the fireworks config generator (it defaults to 1) — but we set it explicitly in `train_common.py`, the `InferenceModule` reads slot 1 (O2), and v1/SPS `sibyl-library` validated + serves it (294-wide). The original (now-false) text follows:
+
+> ~~**The `seq_length`/`feat_ind` position trick does NOT apply to our new model.** It was the *old LGBM* mechanism. The new `dbd_ranker_v0_metaflow` model has no `seq_length`/`feat_ind` anywhere — so we will **not** fix Bug 4 by setting positions. SPS will always read position 0 (O1) for any generic-named feature regardless. The fix is purely O2-naming.~~
 
 **Consequence + why the fix is clean:** because the new model is name-driven, the correct and idiomatic fix is to **name candidate features `…_o2b_…`** so they bind to the `o2_business_id` entity (which feed-service emits, and which resolves to the candidate directly — no seq logic). This is exactly how `o2_business_id_int` already works in the model. **There is no need to set `seq_length`/`feat_ind` or change Sibyl/feed-service.**
 
@@ -153,6 +185,21 @@ For the ~90 candidate features bound to generic `business_id` / `business_vertic
 ### Tier 3 — materialize the genuinely-unmaterialized features (true Bug 3)
 For the §3 rows 1-5 (e.g. `caf_st_p12w_five_star_rate_upper_bound`, `daf_st_p84d_doubledash_business_position_weighted_imp2conv_over_avg`) — source has the data offline (95-100%) but the `feature_group` lacks `materialize_spec`: **add `materialize_spec.sink`** to the existing feature_group (no new source). For row 18 (`daf_st_offers_store_promo_quality_score_v2_cai`, upstream stopped 2026-05-04): revive the upstream or drop the feature.
 
+### §5.1 — cos_sim (Bug 2): Sibyl derived feature (serving-only, no retrain)
+The 5 `cos_sim_*` are scalar `FloatFeature` inputs (`feature_config.py` L65, 222-225); the model does **not** compute them in-graph (`CosineSimilarityLayer` exists at `ranker_dnn.py:183` but is never called in `forward()`). They're computed offline by a PySpark `cos_sim` UDF in the training-instance job → present in training, but **never materialized online → default 0** at serving (Bug 2). Verified per-feature:
+
+| cos_sim feature | operands | servable online? |
+|---|---|---|
+| `cos_sim_copurchase_cx_o2` | `daf_cs_p6m_rx_consumer2vec_copurchase_emb` × `caf_st_rx_store2vec_copurchase_emb` | ✅ both online |
+| `cos_sim_cuisine_tag_cx_o2` | `daf_cs_p6m_cuisine_tag_emb` × `saf_st_cuisine_tag_emb` | ✅ both online |
+| `cos_sim_food_labels_o1_o2` | O1 `saf_st_food_labels_emb` × O2 `saf_st_food_labels_emb` | ✅ online (needs o1/o2 store fetch — same binding theme) |
+| `cos_sim_saf_st_cuisine_tag_o1_o2` | O1 `saf_st_cuisine_tag_emb` × O2 `saf_st_cuisine_tag_emb` | ✅ online (o1/o2 store fetch) |
+| `cos_sim_food_labels_cx_o2` | consumer food-labels emb × `saf_st_food_labels_emb` | ⚠ only if consumer operand is the online `saf_cs_food_labels_emb`, not the offline `caf_cs_saved_store_food_labels_emb` — **confirm in the training-instance script** |
+
+**Fix = Sibyl composite/derived feature** — first-class, production-proven (ads-quality predictors already serve store×cx cosine this way): `Func.cos_sim(EmbeddingInputVariable(A), EmbeddingInputVariable(B), "cos_sim_…")` ([`sibyl-library composite_model.py`](https://github.com/doordash/sibyl-library/blob/master/sibyl_library/models/composite_model.py); op `OpCode::CosineSimilarity` in SPS C++ `composite_model_loader.cc`). Wrap the model as a composite model with 5 `cos_sim` derived nodes feeding the base model's scalar inputs. **The composite wrapper itself needs NO retrain** — the base model already ingests these 5 scalars; the wrapper just makes serving compute the real cosine (matching training) instead of defaulting.
+
+**⚠ But the cos_sim fix is NOT fully independent of the Bug-4 binding work** — its store-side embedding operands inherit the same O1/O2 binding problem. `saf_st_*_emb` is bound to the generic `store_id`, so a `cos_sim_*_cx_o2` (consumer × **O2** store) needs the store embedding fetched at `o2_store_id`, and a `cos_sim_*_o1_o2` needs it at **both** `o1_store_id` and `o2_store_id`. The ads precedent doesn't hit this (single-candidate, no anchor). So the embedding operands likely need **o1/o2-bound clones** (`saf_o2st_*_emb`, etc.) just like the rest of Bug 4 — the unique part here is only the `Func.cos_sim` derived node on top. Prereqs: (1) confirm the `cos_sim_food_labels_cx_o2` consumer operand (online `saf_cs_food_labels_emb` vs offline `caf_cs_saved_store_food_labels_emb`); (2) clone/bind the store-side embedding operands to `o2_store` (and `o1_store` for the o1_o2 pairs) and materialize them online; (3) the cosine must use the **same** operand embeddings the offline training UDF used, or it reintroduces train/serve skew.
+
 ---
 
 ## 6. Retrain & backfill plan
@@ -170,6 +217,18 @@ For the §3 rows 1-5 (e.g. `caf_st_p12w_five_star_rate_upper_bound`, `daf_st_p84
 - **Do NOT mutate or delete `doubledash_store_engagement_cs_b.py`** (or rename its column). It's consumed by many active models — `dd-models` `store_ranking_feature_config_v1`, `lucent-training` `doubledash_store_ranker_v6_3` + item rankers, `dbd_store_ranker_development` v10–v12 + `model_config_v21`, `sibyl-models` LGBM v02-01/02-02, and 6 fabricator training instances. Mutating it breaks their training/serving. The fix is **additive** (new O2 sources / use existing twins); other models migrate on their own cadence.
 - **Don't try to fix this via `seq_length`/`feat_ind` on the new model** — the new fireworks path has no position mechanism and relies on entity names. Naming features `…_o2b_…` is the correct lever.
 - **Don't "publish under the cs_b name but bind to O2"** — the AIMS entity binding is derived from the feature *name*, so the name must carry `o2b`.
+
+### Precedent & implementation risk (de-risking check)
+
+**The name-based o1/o2 binding is an established, platform-blessed, LOW-RISK pattern — the DbD store ranker is not an early adopter.** o1/o2 entities are reserved as first-class types in the proto layer ([`cancun ml_entity.proto`](https://github.com/doordash/cancun/blob/master/protos/public/ml_platform/ml_entity/v1/ml_entity.proto): `o1_store_id=55, o2_store_id=56, o1_business_id=57, o2_business_id=58, o1_business_vertical_id=59, o2_business_vertical_id=60`, each with a `short_name` like `o2b`), codegen'd into pedregal/Go/Kotlin/Java, registered in [`entities.yaml`](https://github.com/doordash/fabricator/blob/master/fabricator/repository/entities.yaml), and resolved-by-name end-to-end. A **second production model already serves o2-named features the same way**: the DbD **item** ranker (predictor `retail_item_recommendation_ranking`) — feed-service `DoubleDashItemRankingFeatureGenerator` emits `o1_*`/`o2_*` entities, and the live pedregal scorer [`entity_builder_doubledash.go`](https://github.com/doordash/pedregal/blob/master/nodes/consumer/newverticals/ranking/item_scorer/entity_builder_doubledash.go) builds them (`addDoubleDashO2Entities`). o2-clone sources are also used cross-team (cx_discovery, sponsored_listing).
+
+**Gotchas to respect during implementation:**
+- **Reuse the existing registered short-names** (`o2_business_id`/`o2b`, `o2_store_id`/`o2st`, `o2_business_vertical_id`/`o2bizv`). They already exist → **no proto change, no new entity registration, no ML-platform ask**. A token NOT in `entities.yaml` silently fails to resolve at serving.
+- **Asymmetric hashing footgun:** `o1bmsid` is `should_hash: true` but `o2bmsid` is **not** — be careful if any cloned feature keys on merchant-supplied-id across positions.
+- **Serving has no seqIndex support on these entities** (the Go scorer notes "MLEntity has no SeqIndex field") — confirms explicit o2_ naming is the *only* supported route, not positions.
+- **Shared embedding-table invariant:** keep `o1_business_id_int`/`o2_business_id_int` (+ the int-list sequence) on the same `max_value=199_999` table, or training hits the CUDA `srcIndex < srcSelectDimSize` assertion (already documented in `feature_config.py`).
+- **Cost is uneven:** business-keyed engagement features clone cheaply (column re-key of the existing base instance); per-pair `o1b_o2b` aggregations are genuine recomputes — budget for those specifically.
+- **Multi-entity token ordering:** follow the existing alphabetical convention for `o1b_o2b`-style names so the binding parses correctly.
 
 ---
 
@@ -193,7 +252,7 @@ Organized by **feature group** (not by bug). "Intrinsically O2?" = is the featur
 | **Store-keyed**: `saf_st_*` (attrs), `caf_st_*` (ratings), `daf_st_*` (discovery/attach), `caf_cs_st_*` (cx-store), `saf_dprg_st_*` | ~43 | **No** (symmetric store stat) | bound to `store_id` → **O1**; subset also unmaterialized | Bug 4 binding **+ Bug 3** for `caf_st_p12w_five_star_rate_upper_bound`, `daf_st_p84d_..._imp2conv_over_avg` (0% online, source has data) | clone `…_o2_store_…` + `materialize_spec`; for the Bug-3 subset add sink to existing group | yes (T2); Bug-3 subset no-retrain |
 | **User-history sequence** `caf_cs_p84d_organic_converted_business_id_…_sequence` | 1 | n/a (consumer history; feeds attention) | **0%** (Sibyl-side, not materialized) | Bug 3 | add `materialize_spec` | no |
 | **Consumer-only** `daf_cs_p10r/p184d_*`, `cs_dprg_*` | ~11 | n/a (consumer-keyed; `consumer_id` unambiguous) | served | — none | — | — |
-| **`cos_sim_*`** (cx_o2 / o1_o2 cosine sims) | ~10 | n/a (computed in-model from embeddings) | in-graph; 5 depend on unmaterialized embeddings | **Bug 2** (5 cos_sim) | materialize the 5 source embeddings | with T2 |
+| **`cos_sim_*`** (cx_o2 / o1_o2 cosine sims) | 5 | n/a (scalar inputs; offline-computed, **not** in-graph) | **0%** (Bug 2 — offline-only scalar, defaults online) | **Bug 2** | Sibyl **derived feature** (composite model `Func.cos_sim` over the two embeddings) — serving-only, **no retrain**; ensure both operand embeddings are online (4/5 already; see §5.1) | no |
 | **QUERY-side** `o1_business_id_int`, `o1_business_vertical_id`, `o1_primary_category_id`, `o1_is_caviar`, `submarket_id`, `hour_of_day`, `day_of_week` | 8 | n/a (O1 by name / request context) | defaulted in NEW path | **Bug 1** | feed-service NEW-path gate + `_int` naming (root-cause doc §1) | — |
 
 **How the groups map to the fix tiers:** **T1** = drop the 2 duplicate groups (`baf_cs_b_*`, `baf_b_sm_*`). **T2** = clone O2-bound sources for the generic-bound groups (`baf_b_*`, `baf_bizv_cs_*`, `caf/daf_cs_b_*`, `caf/daf_cs_bizv_*`, store-keyed) + rename the (already-O2) parquet columns + retrain. **T3** = add `materialize_spec` to the genuinely-unmaterialized groups (history sequence; `baf_o1b_o2bizv_*`; the store Bug-3 subset) — no retrain.
@@ -203,3 +262,32 @@ Organized by **feature group** (not by bug). "Intrinsically O2?" = is the featur
 **Verified non-issues:** training data is O2-correct across all groups (no relabeling); model architecture is sound (single-tower DCNv2+attention); `cs_b ≡ cs_o2b` exactly; `baf_o1b_o2b_*` serves correctly (80.2%); consumer-only and QUERY-side O1 features are not part of the O1/O2 binding bug.
 
 **One-retrain plan:** T1 + T2 land together in a single retrain on the reused April parquet; T3 `materialize_spec` PRs are independent serving-only changes that need no retrain.
+
+---
+
+## 9. Future Serving-V2 migration (how to do it right for a seq_length model)
+
+DbD prod is on **serving-v1 / SPS** today. core-ml-platform is migrating all P0 SPS predictors to **serving-v2** (Triton / `mlp-next-serving`); goal = per-model prediction isolation.
+
+**References (verified via Glean, 2026-06-29):**
+- RFC *"Unification: Migrate Sibyl Prediction Service to Serving V2"* — https://docs.google.com/document/d/1918SW-oGUPKQkwAcHuyuBwfSQPQpCKhOClhng7SMOTA (Haifeng Geng, Songze Li, Kornel Csernai)
+- Serving V2 Quick Start — https://docs.google.com/document/d/17hPuXKACAqaX7q4BPxVwdNNm53-x0IJGkQJG0XBi0vo
+- Serving V2 Runbook — https://doordash.atlassian.net/wiki/spaces/Eng/pages/4521001266
+- Jira "Complete SV2 onboarding of all P0 SPS predictors" — https://doordash.atlassian.net/browse/MSH2-1066 ; SPS-v2 capability Q&A — https://doordash.atlassian.net/browse/MLP2024-3335
+- In-progress DbD v2 artifact: AIMS predictor `doubledash_store_recommendation_ranking_migration_sv2` → deployment `doubledash-store-recommendation-19ba-msv2-v1` (the OLD 55-feature, seq=1 model; owned by core-ml-platform).
+
+**Stack mapping:** v1 = columbus predictor config + `register_sibyl_model_from_path` (SibylModel) + SPS assembles inputs. v2 = AIMS deployment/predictor + Triton (`config.pbtxt`) + `mlp-next-serving`. **AIMS is shared by both; columbus is v1-only.**
+
+### The trap (what crashed our v2 test)
+The **generic dd-models playground deploy** uses `libraries/dd_models_lib/deployment/triton_model_loader.py:221` → `numerical_feature_dims = len(numerical_features)` = **161**, ignoring `seq_length` (it expands seq for *neither* numerical nor embedding). A seq model deployed this way gets an under-sized `config.pbtxt` and crashes at inference (proven). **Do not deploy a seq model via the generic playground path.**
+
+### How seq models actually serve on v2 (precedent: item_ranker)
+`models/consumer/p13n/feed_ranking_fw/item_ranker_v0/deployment/` ships a **custom deployment prep**: `model_prepare.py:get_emb_index_dict` loops `range(seq_length)` to size/slice the seq-expanded tensor, registered via `register_triton_schema_model_from_path`; `deploy_servingV2_model.py` wires it. The v2 pipeline `prediction_pipeline_factory.py:_build_pipeline` just **forwards** `pipeline_inputs.numerical_features` — the width is set by the schema + the upstream feature-fetch, not reshaped in-pipeline. (Note: prod `19ba` showed `numerical=90 ≠ 48` featureDeps because its custom wrapper declared a dense+quantized width — same principle: the schema width is author-controlled, not a naive count.)
+
+### Migration checklist for DbD W1 → v2
+1. **Do NOT use the generic playground deploy** (sizes 161). Copy item_ranker's `deployment/model_prepare.py` + `deploy_servingV2_model.py` and declare `numerical_features = 294` (= `sum(seq_length)`) in the Triton `config.pbtxt`.
+2. **Verify the v2 feature-fetch packs the 133 seq2 features as `[O1@slot0, O2@slot1]`** into the numerical tensor. item_ranker proves v2 honors `seq_length` for **embeddings**; seq on the **numerical tensor** specifically is the one unverified inch (no precedent found). Confirm with a live request before any ramp.
+3. **Coordinate with core-ml-platform** (they own `_migration_sv2`) so DbD's v2 deployment is built seq-aware from the start — hand them the `numerical=294` + `seq_length=2` contract and the 133-feature list.
+4. **The model artifact is identical** across v1/v2 (`InferenceModule` already expands seq + selects O2) — only the deploy/config layer differs.
+
+**Net:** v1 now (fast, proven). v2 later via a custom prep script — same model, seq-aware schema, no feature recompute. The generic playground path is the one thing to avoid.
